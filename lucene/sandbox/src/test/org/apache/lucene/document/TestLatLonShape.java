@@ -17,7 +17,9 @@
 package org.apache.lucene.document;
 
 import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
+import org.apache.lucene.document.LatLonShape.QueryRelation;
 import org.apache.lucene.geo.GeoTestUtil;
+import org.apache.lucene.geo.Line;
 import org.apache.lucene.geo.Polygon;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
@@ -43,8 +45,15 @@ public class TestLatLonShape extends LuceneTestCase {
     }
   }
 
+  protected void addLineToDoc(String field, Document doc, Line line) {
+    Field[] fields = LatLonShape.createIndexableFields(field, line);
+    for (Field f : fields) {
+      doc.add(f);
+    }
+  }
+
   protected Query newRectQuery(String field, double minLat, double maxLat, double minLon, double maxLon) {
-    return LatLonShape.newBoxQuery(field, minLat, maxLat, minLon, maxLon);
+    return LatLonShape.newBoxQuery(field, QueryRelation.INTERSECTS, minLat, maxLat, minLon, maxLon);
   }
 
   @Ignore
@@ -81,19 +90,23 @@ public class TestLatLonShape extends LuceneTestCase {
     Directory dir = newDirectory();
     RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
 
-    // add a random polygon without a hole
+    // add a random polygon document
     Polygon p = GeoTestUtil.createRegularPolygon(0, 90, atLeast(1000000), numVertices);
     Document document = new Document();
     addPolygonsToDoc(FIELDNAME, document, p);
     writer.addDocument(document);
 
-    // add a random polygon with a hole
-    Polygon inner = new Polygon(new double[] {-1d, -1d, 1d, 1d, -1d},
-        new double[] {-91d, -89d, -89d, -91.0, -91.0});
-    Polygon outer = GeoTestUtil.createRegularPolygon(0, -90, atLeast(1000000), numVertices);
-
+    // add a line document
     document = new Document();
-    addPolygonsToDoc(FIELDNAME, document, new Polygon(outer.getPolyLats(), outer.getPolyLons(), inner));
+    // add a line string
+    double lats[] = new double[p.numPoints() - 1];
+    double lons[] = new double[p.numPoints() - 1];
+    for (int i = 0; i < lats.length; ++i) {
+      lats[i] = p.getPolyLat(i);
+      lons[i] = p.getPolyLon(i);
+    }
+    Line l = new Line(lats, lons);
+    addLineToDoc(FIELDNAME, document, l);
     writer.addDocument(document);
 
     ////// search /////
@@ -101,15 +114,42 @@ public class TestLatLonShape extends LuceneTestCase {
     IndexReader reader = writer.getReader();
     writer.close();
     IndexSearcher searcher = newSearcher(reader);
-    Query q = newRectQuery(FIELDNAME, -1d, 1d, p.minLon, p.maxLon);
-    assertEquals(1, searcher.count(q));
+    double minLat = Math.min(lats[0], lats[1]);
+    double minLon = Math.min(lons[0], lons[1]);
+    double maxLat = Math.max(lats[0], lats[1]);
+    double maxLon = Math.max(lons[0], lons[1]);
+    Query q = newRectQuery(FIELDNAME, minLat, maxLat, minLon, maxLon);
+    assertEquals(2, searcher.count(q));
 
     // search a disjoint bbox
     q = newRectQuery(FIELDNAME, p.minLat-1d, p.minLat+1, p.minLon-1d, p.minLon+1d);
     assertEquals(0, searcher.count(q));
 
+    IOUtils.close(reader, dir);
+  }
+
+  /** test random polygons with a single hole */
+  public void testPolygonWithHole() throws Exception {
+    int numVertices = TestUtil.nextInt(random(), 50, 100);
+    Directory dir = newDirectory();
+    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+
+    // add a random polygon with a hole
+    Polygon inner = new Polygon(new double[] {-1d, -1d, 1d, 1d, -1d},
+        new double[] {-91d, -89d, -89d, -91.0, -91.0});
+    Polygon outer = GeoTestUtil.createRegularPolygon(0, -90, atLeast(1000000), numVertices);
+
+    Document document = new Document();
+    addPolygonsToDoc(FIELDNAME, document, new Polygon(outer.getPolyLats(), outer.getPolyLons(), inner));
+    writer.addDocument(document);
+
+    ///// search //////
+    IndexReader reader = writer.getReader();
+    writer.close();
+    IndexSearcher searcher = newSearcher(reader);
+
     // search a bbox in the hole
-    q = newRectQuery(FIELDNAME, inner.minLat + 1e-6, inner.maxLat - 1e-6, inner.minLon + 1e-6, inner.maxLon - 1e-6);
+    Query q = newRectQuery(FIELDNAME, inner.minLat + 1e-6, inner.maxLat - 1e-6, inner.minLon + 1e-6, inner.maxLon - 1e-6);
     assertEquals(0, searcher.count(q));
 
     IOUtils.close(reader, dir);
@@ -156,6 +196,29 @@ public class TestLatLonShape extends LuceneTestCase {
 
     // search a bbox in the hole
     q = newRectQuery(FIELDNAME, inner.minLat + 1e-6, inner.maxLat - 1e-6, inner.minLon + 1e-6, inner.maxLon - 1e-6);
+    assertEquals(0, searcher.count(q));
+
+    IOUtils.close(reader, dir);
+  }
+
+  public void testLUCENE8454() throws Exception {
+    Directory dir = newDirectory();
+    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
+
+    Polygon poly = new Polygon(new double[] {-1.490648725633769E-132d, 90d, 90d, -1.490648725633769E-132d},
+        new double[] {0d, 0d, 180d, 0d});
+
+    Document document = new Document();
+    addPolygonsToDoc(FIELDNAME, document, poly);
+    writer.addDocument(document);
+
+    ///// search //////
+    IndexReader reader = writer.getReader();
+    writer.close();
+    IndexSearcher searcher = newSearcher(reader);
+
+    // search a bbox in the hole
+    Query q = LatLonShape.newBoxQuery(FIELDNAME, QueryRelation.DISJOINT,-29.46555603761226d, 0.0d, 8.381903171539307E-8d, 0.9999999403953552d);
     assertEquals(0, searcher.count(q));
 
     IOUtils.close(reader, dir);

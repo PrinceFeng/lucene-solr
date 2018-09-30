@@ -24,6 +24,7 @@ import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.io.StringReader;
 import java.io.UnsupportedEncodingException;
+import java.io.Writer;
 import java.lang.invoke.MethodHandles;
 import java.net.URL;
 import java.net.URLDecoder;
@@ -40,6 +41,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -55,6 +57,7 @@ import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SpecProvider;
 import org.apache.solr.common.cloud.SolrZkClient;
 import org.apache.solr.common.cloud.ZkOperation;
+import org.apache.solr.common.cloud.ZkStateReader;
 import org.apache.solr.common.params.CommonParams;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.server.ByteBufferInputStream;
@@ -64,8 +67,10 @@ import org.noggit.JSONWriter;
 import org.noggit.ObjectBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Collections.singletonList;
 import static java.util.Collections.unmodifiableList;
 import static java.util.Collections.unmodifiableSet;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
@@ -138,13 +143,34 @@ public class Utils {
     return mutable ? result : result instanceof Set ? unmodifiableSet((Set) result) : unmodifiableList((List) result);
   }
 
-  public static void toJSON(Object o, OutputStream os, boolean indent) throws IOException {
-    OutputStreamWriter writer = new OutputStreamWriter(os, UTF_8);
+  public static void writeJson(Object o, OutputStream os, boolean indent) throws IOException {
+    writeJson(o, new OutputStreamWriter(os, UTF_8), indent)
+        .flush();
+  }
+
+  public static Writer writeJson(Object o, Writer writer, boolean indent) throws IOException {
     new SolrJSONWriter(writer)
         .setIndent(indent)
         .writeObj(o)
         .close();
-    writer.flush();
+    return writer;
+  }
+
+  private static class MapWriterJSONWriter extends JSONWriter {
+
+    public MapWriterJSONWriter(CharArr out, int indentSize) {
+      super(out, indentSize);
+    }
+
+    @Override
+    public void handleUnknownClass(Object o) {
+      if (o instanceof MapWriter) {
+        Map m = ((MapWriter)o).toMap(new LinkedHashMap<>());
+        write(m);
+      } else {
+        super.handleUnknownClass(o);
+      }
+    }
   }
 
   public static byte[] toJSON(Object o) {
@@ -157,7 +183,7 @@ public class Utils {
         o = ((IteratorWriter)o).toList(new ArrayList<>());
       }
     }
-    new JSONWriter(out, 2).write(o); // indentation by default
+    new MapWriterJSONWriter(out, 2).write(o); // indentation by default
     return toUTF8(out);
   }
 
@@ -207,7 +233,7 @@ public class Utils {
 
   public static Object fromJSON(InputStream is){
     try {
-      return new ObjectBuilder(getJSONParser((new InputStreamReader(is, StandardCharsets.UTF_8)))).getObject();
+      return new ObjectBuilder(getJSONParser((new InputStreamReader(is, StandardCharsets.UTF_8)))).getVal();
     } catch (IOException e) {
       throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Parse error", e);
     }
@@ -235,13 +261,14 @@ public class Utils {
 
   public static Object fromJSONString(String json)  {
     try {
-      return new ObjectBuilder(getJSONParser(new StringReader(json))).getObject();
+      return new ObjectBuilder(getJSONParser(new StringReader(json))).getVal();
     } catch (IOException e) {
       throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Parse error", e);
     }
   }
 
   public static Object getObjectByPath(Object root, boolean onlyPrimitive, String hierarchy) {
+    if (hierarchy == null) return getObjectByPath(root, onlyPrimitive, singletonList(null));
     List<String> parts = StrUtils.splitSmart(hierarchy, '/');
     if (parts.get(0).isEmpty()) parts.remove(0);
     return getObjectByPath(root, onlyPrimitive, parts);
@@ -337,8 +364,12 @@ public class Utils {
         Object val = getVal(obj, s);
         if (val == null) return null;
         if (idx > -1) {
-          List l = (List) val;
-          val = idx < l.size() ? l.get(idx) : null;
+          if (val instanceof IteratorWriter) {
+            val = getValueAt((IteratorWriter) val, idx);
+          } else {
+            List l = (List) val;
+            val = idx < l.size() ? l.get(idx) : null;
+          }
         }
         if (onlyPrimitive && isMapLike(val)) {
           return null;
@@ -348,6 +379,27 @@ public class Utils {
     }
 
     return false;
+  }
+
+  private static Object getValueAt(IteratorWriter iteratorWriter, int idx) {
+    Object[] result = new Object[1];
+    try {
+      iteratorWriter.writeIter(new IteratorWriter.ItemWriter() {
+        int i = -1;
+
+        @Override
+        public IteratorWriter.ItemWriter add(Object o) {
+          ++i;
+          if (i > idx) return this;
+          if (i == idx) result[0] = o;
+          return this;
+        }
+      });
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+    return result[0];
+
   }
 
   private static boolean isMapLike(Object o) {
@@ -530,5 +582,24 @@ public class Utils {
 
   public static long timeElapsed(TimeSource timeSource, long start, TimeUnit unit) {
     return unit.convert(timeSource.getTimeNs() - NANOSECONDS.convert(start, unit), NANOSECONDS);
+  }
+
+  public static String getMDCNode() {
+    String s = MDC.get(ZkStateReader.NODE_NAME_PROP);
+    if (s == null) return null;
+    if (s.startsWith("n:")) {
+      return s.substring(2);
+    } else {
+      return null;
+    }
+  }
+
+  public static <T> T handleExp(Logger logger, T def, Callable<T> c) {
+    try {
+      return c.call();
+    } catch (Exception e) {
+      logger.error(e.getMessage(), e);
+    }
+    return def;
   }
 }
